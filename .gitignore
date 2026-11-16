@@ -7,8 +7,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-# Protein Fold Design
+# Protein Fold Design / Docking
 *.pdb
+*.pdbqt
 *.trb
 
 # C extensions
@@ -235,9 +236,16 @@ redundant/
 data/bioagents_admin.db
 data/bioagents_admin.db-shm
 data/bioagents_admin.db-wal
+data/*.fasta
+data/*.fa
+data/*.pdbqt
+data/*.sdf
+data/*.mol2
+data/*.cif
 sandbox_workdir/
 debug_tool_outputs/
 generated_artifacts/
+/uploads/
 
 # Coverage output
 htmlcov/
