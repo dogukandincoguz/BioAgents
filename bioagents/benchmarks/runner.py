@@ -616,7 +616,7 @@ def run_use_case(
                     msg_content = str(msg_content)
                 msg_dict: dict = {
                     "type": type(msg).__name__,
-                    "content": msg_content[:2000],
+                    "content": msg_content[:10000],
                 }
                 tool_calls_attr = getattr(msg, "tool_calls", None)
                 if tool_calls_attr:

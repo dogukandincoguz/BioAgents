@@ -2,6 +2,8 @@
 
 import json
 import logging
+import re
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -51,6 +53,30 @@ def analyze_execution_mode(messages: list) -> tuple[str, str]:
         )
 
 
+def _is_invalid_summary_response(response: Any, summary_mode: str, messages: list) -> bool:
+    """Check if the summary agent returned an empty, raw-tool-call, or hallucinated response."""
+    if is_empty_response(response):
+        return True
+    if getattr(response, "tool_calls", None):
+        return True
+    text = str(getattr(response, "content", "") or "").strip()
+    if "<tool_call>" in text or "</tool_call>" in text or "<arg_key>" in text:
+        return True
+    if re.match(
+        r"^(I'll\s+run|I\s+will\s+run|Let\s+me\s+run|I\s+will\s+now\s+call|I'll\s+now\s+execute)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    msg_list = messages or []
+    return bool(
+        summary_mode == "full_summary"
+        and len(text) < 120
+        and len(msg_list) > 4
+        and len(extract_best_content(msg_list)) > len(text)
+    )
+
+
 def create_summary_agent():
     """
     Create the Summary Agent.
@@ -89,20 +115,21 @@ def create_summary_agent():
         result = invoke_with_retry("Summary", llm, messages_with_system, max_retries=1)
 
         response = result["messages"][0]
-        if is_empty_response(response):
+        if _is_invalid_summary_response(response, mode, messages):
+            logger.warning(
+                "Invalid summary response (%r...); falling back to extract_best_content",
+                str(getattr(response, "content", ""))[:80],
+            )
             best = extract_best_content(messages)
-            if best:
-                fallback_content = (
-                    "## Workflow Summary\n\n"
-                    "The following results were produced during this workflow:\n\n"
-                    f"{best}"
-                )
-            else:
-                fallback_content = (
+            fallback_content = (
+                best
+                if best
+                else (
                     "The workflow completed but was unable to generate a summary. "
                     "Please review the agent outputs in the audit log for details."
                 )
-            return {"messages": [AIMessage(content=fallback_content)]}
+            )
+            return {"messages": [AIMessage(content=fallback_content, name="Summary")]}
 
         return result
 

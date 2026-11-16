@@ -16,6 +16,7 @@ from bioagents.sandbox.coder_executor import create_executor
 from bioagents.sandbox.coder_helpers import (
     DEFAULT_DL_IMPORTS,
     append_code_agent_status_footer,
+    append_completion_marker,
     build_task_with_output_dir,
     collect_code_agent_run_telemetry,
     extract_available_data,
@@ -72,6 +73,17 @@ def create_dl_agent(
     )
 
     return agent
+
+
+def _delivered_final_answer(agent: Any) -> bool:
+    meta = getattr(agent, "_last_execution_meta", None)
+    if isinstance(meta, dict):
+        return bool(meta.get("delivered_final_answer"))
+    agent_memory = getattr(agent, "memory", None)
+    steps = getattr(agent_memory, "steps", None)
+    if isinstance(steps, list):
+        return any(getattr(step, "is_final_answer", False) for step in steps)
+    return False
 
 
 def _subagent_step_kwargs(agent: Any) -> dict[str, Any]:
@@ -157,6 +169,9 @@ def create_dl_node(agent: CodeAgent) -> Callable:
                     execution_steps.append(step_data)
 
             logger.info("Extracted %d execution steps", len(execution_steps))
+
+            if _delivered_final_answer(agent) and not content.startswith("Error in "):
+                content = append_completion_marker(content)
 
             structured = {"model_result": {"summary": content, "code_steps": execution_steps}}
 
