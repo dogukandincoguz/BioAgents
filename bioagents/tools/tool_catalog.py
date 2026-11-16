@@ -30,6 +30,33 @@ FAMILY_ROLES = {
     "transcriptomics_tools": ("transcriptomics",),
 }
 
+LOCAL_TOOL_ROLES: dict[str, tuple[str, ...]] = {
+    "prepare_receptor": ("docking",),
+    "prepare_ligand": ("docking",),
+    "identify_binding_site": ("docking",),
+    "run_docking": ("docking",),
+    "analyze_docking_results": ("docking",),
+    "run_blast_search": ("genomics", "phylogenetics"),
+    "search_pubmed": ("literature", "research"),
+    "fetch_uniprot_fasta": ("research", "data_acquisition"),
+    "download_structure_file": ("structural_biology", "research", "data_acquisition"),
+    "create_scatter_plot": ("visualization",),
+}
+
+SDK_TOOL_ROLES: dict[str, tuple[str, ...]] = {
+    "genmol": ("protein_design", "research"),
+    "NvidiaNIM_genmol": ("protein_design", "research"),
+    "ESM2_score_missense_variant": ("analysis", "structural_biology"),
+    "COSMIC_get_mutations_by_gene": ("genomics", "research"),
+    "ClinVar_search_variants": ("genomics", "research"),
+    "Enamine_search_smiles": ("research", "data_acquisition"),
+    "ChEMBL_search_activities": ("research", "data_acquisition"),
+    "ChEMBL_search_molecules": ("research", "data_acquisition"),
+    "ChEMBL_get_target_activities": ("research", "data_acquisition"),
+    "ChEMBL_search_similar_molecules": ("research", "data_acquisition"),
+    "ZINC_search_by_smiles": ("research", "data_acquisition"),
+}
+
 
 @lru_cache(maxsize=4)
 def local_index(directory: Path | None = None) -> dict[str, tuple[str, str]]:
@@ -136,18 +163,25 @@ def describe_tool(name: str, selection) -> dict:
         entry = sdk_entries().get(backend or name)
         if entry is None:
             raise ValueError(f"ToolUniverse metadata is unavailable for selected tool {name}")
+        sdk_name = backend or name
+        agent_roles = SDK_TOOL_ROLES.get(
+            name,
+            SDK_TOOL_ROLES.get(sdk_name, ("research", "literature", "genomics", "transcriptomics")),
+        )
         return {
             "name": name,
             "description": entry.get("description", name),
             "schema": entry["parameter"],
             "source": "sdk",
             "backend": backend or name,
-            "roles": ("research", "literature", "genomics", "transcriptomics"),
+            "roles": agent_roles,
         }
     index = local_index()
     if name in index:
         module, attribute = index[name]
         obj = getattr(importlib.import_module(module), attribute)
+        family = module.rsplit(".", 1)[-1]
+        agent_roles = LOCAL_TOOL_ROLES.get(name, FAMILY_ROLES.get(family, ("research",)))
         return {
             "name": name,
             "description": obj.description,
@@ -161,7 +195,7 @@ def describe_tool(name: str, selection) -> dict:
             "source": "local",
             "module": module,
             "attribute": attribute,
-            "roles": FAMILY_ROLES.get(module.rsplit(".", 1)[-1], ("research",)),
+            "roles": agent_roles,
         }
     entry = custom_entries().get(name)
     if entry is not None:
@@ -173,3 +207,63 @@ def describe_tool(name: str, selection) -> dict:
             "roles": ("research",),
         }
     raise ValueError(f"Unknown selected local tool: {name}. Check its registered name.")
+
+
+def build_tool_catalog() -> dict[str, dict]:
+    """Build a comprehensive catalog of all local and SDK tools with their scope-aligned roles."""
+    catalog: dict[str, dict] = {}
+
+    idx = local_index()
+    for tool_name, (module, _) in idx.items():
+        family = module.rsplit(".", 1)[-1]
+        agent_roles = LOCAL_TOOL_ROLES.get(tool_name, FAMILY_ROLES.get(family, ("research",)))
+        catalog[tool_name] = {
+            "name": tool_name,
+            "roles": agent_roles,
+            "agent_roles": agent_roles,
+            "source": "local",
+            "family": family,
+            "module": module,
+        }
+
+    sdk = sdk_entries()
+    for sdk_name, entry in sdk.items():
+        agent_roles = SDK_TOOL_ROLES.get(
+            sdk_name, ("research", "literature", "genomics", "transcriptomics")
+        )
+        catalog[sdk_name] = {
+            "name": sdk_name,
+            "roles": agent_roles,
+            "agent_roles": agent_roles,
+            "source": "sdk",
+            "description": entry.get("description", sdk_name),
+            "schema": entry.get("parameter", {}),
+        }
+
+    for name, agent_roles in SDK_TOOL_ROLES.items():
+        if name not in catalog:
+            catalog[name] = {
+                "name": name,
+                "roles": agent_roles,
+                "agent_roles": agent_roles,
+                "source": "sdk",
+            }
+        else:
+            catalog[name]["roles"] = agent_roles
+            catalog[name]["agent_roles"] = agent_roles
+
+    for name, _entry in custom_entries().items():
+        if name not in catalog:
+            catalog[name] = {
+                "name": name,
+                "roles": ("research",),
+                "agent_roles": ("research",),
+                "source": "custom",
+            }
+
+    return catalog
+
+
+def get_tool_catalog() -> dict[str, dict]:
+    """Return the tool catalog."""
+    return build_tool_catalog()

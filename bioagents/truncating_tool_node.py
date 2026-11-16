@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -87,14 +89,27 @@ def truncate_tool_messages_payload(payload: Any, max_chars: int = MAX_TOOL_OUTPU
 def _requested_calls(input: Any) -> list:
     if isinstance(input, list):
         if input and isinstance(input[-1], dict) and input[-1].get("type") == "tool_call":
-            return input
-        messages = input
+            calls = input
+        else:
+            messages = input
+            last = messages[-1] if messages else None
+            calls = last.tool_calls if isinstance(last, AIMessage) else []
     else:
         messages = (
             input.get("messages", []) if isinstance(input, dict) else getattr(input, "messages", [])
         )
-    last = messages[-1] if messages else None
-    return last.tool_calls if isinstance(last, AIMessage) else []
+        last = messages[-1] if messages else None
+        calls = last.tool_calls if isinstance(last, AIMessage) else []
+
+    if isinstance(calls, list):
+        for tc in calls:
+            if isinstance(tc, dict):
+                raw_name = str(tc.get("name") or "").strip()
+                if "<" in raw_name or ">" in raw_name or " " in raw_name or "\n" in raw_name:
+                    clean_name = re.split(r"[<\s>]", raw_name, maxsplit=1)[0].strip()
+                    if clean_name:
+                        tc["name"] = clean_name
+    return calls
 
 
 def _defer_tool_batch(calls: list, blocked_index: int, denial: ToolMessage) -> dict:
@@ -129,12 +144,44 @@ def _selection_denial(input: Any, selection, tool_names: set[str]) -> dict | Non
     calls = _requested_calls(input)
     for index, call in enumerate(calls):
         name = call.get("name", "unknown")
-        if not selection.allows(name) or name not in tool_names:
+        if not selection.allows(name):
             return _defer_tool_batch(
                 calls,
                 index,
                 ToolMessage(
                     content=json.dumps(unavailable_tool(name)),
+                    name=name,
+                    tool_call_id=call.get("id") or str(uuid.uuid4()),
+                    status="error",
+                ),
+            )
+        elif name not in tool_names:
+            from bioagents.tools.tool_catalog import get_tool_catalog
+
+            catalog_entry = None
+            with contextlib.suppress(Exception):
+                catalog_entry = get_tool_catalog().get(name)
+            roles = ()
+            if catalog_entry:
+                roles = catalog_entry.get("roles") or catalog_entry.get("agent_roles") or ()
+            roles_str = f" [{', '.join(roles)}]" if roles else ""
+            denial_msg = {
+                "status": "wrong_agent_for_tool",
+                "error_code": "wrong_agent_for_tool",
+                "tool_name": name,
+                "owning_agents": list(roles),
+                "message": (
+                    f"Tool '{name}' is not bound to this agent. It is owned by{roles_str} specialist agent(s). "
+                    "Do not retry this tool yourself; complete your current scope and ask the Supervisor to route to the appropriate specialist or sandbox agent."
+                ),
+                "execution_state": "not_started",
+                "retryable": False,
+            }
+            return _defer_tool_batch(
+                calls,
+                index,
+                ToolMessage(
+                    content=json.dumps(denial_msg),
                     name=name,
                     tool_call_id=call.get("id") or str(uuid.uuid4()),
                     status="error",
@@ -152,6 +199,7 @@ class TruncatingToolRunnable(Runnable):
 
         self._selection = get_selection()
         self._tool_names = {tool.name for tool in tools}
+        self._bound_tool_names = self._tool_names
         self._inner = ToolNode(tools)
         self._max_chars = MAX_TOOL_OUTPUT_CHARS
 
@@ -159,7 +207,7 @@ class TruncatingToolRunnable(Runnable):
         from bioagents.tools.tool_selection import selection_scope
 
         with selection_scope(self._selection):
-            denial = _selection_denial(input, self._selection, self._tool_names)
+            denial = _selection_denial(input, self._selection, self._bound_tool_names)
             if denial is not None:
                 return denial
             out = invoke_with_retry(self._inner.invoke, input, config, **kwargs)
@@ -169,7 +217,7 @@ class TruncatingToolRunnable(Runnable):
         from bioagents.tools.tool_selection import selection_scope
 
         with selection_scope(self._selection):
-            denial = _selection_denial(input, self._selection, self._tool_names)
+            denial = _selection_denial(input, self._selection, self._bound_tool_names)
             if denial is not None:
                 return denial
             out = await ainvoke_with_retry(self._inner.ainvoke, input, config, **kwargs)
@@ -201,6 +249,7 @@ class ApprovalToolRunnable(Runnable):
 
         self._selection = get_selection()
         self._tool_names = {tool.name for tool in tools}
+        self._bound_tool_names = self._tool_names
         self._inner = ToolNode(tools)
         self._max_chars = MAX_TOOL_OUTPUT_CHARS
         self._policy = policy or get_default_policy()
@@ -213,7 +262,7 @@ class ApprovalToolRunnable(Runnable):
 
     def _invoke(self, input: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
         """Execute tools with policy check and truncation."""
-        denial = _selection_denial(input, self._selection, self._tool_names)
+        denial = _selection_denial(input, self._selection, self._bound_tool_names)
         if denial is not None:
             return denial
         for tc in _requested_calls(input):

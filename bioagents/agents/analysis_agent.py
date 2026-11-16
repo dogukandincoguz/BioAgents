@@ -3,13 +3,12 @@
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.tools import BaseTool
+from langchain_core.messages import AIMessage
 
-from bioagents.agents.agent_executor import execute_agent_with_tools, safe_json_output
-from bioagents.agents.helpers import resolve_tool_name
+from bioagents.agents.helpers import create_retry_response, prepare_messages_for_agent
 from bioagents.llms.llm_provider import get_llm
 from bioagents.prompts.prompt_loader import load_prompt
+from bioagents.prompts.tool_context import inject_prompt_context
 from bioagents.tools.selected_runtime import bind_agent_node, bind_agent_tools, tools_for_agent
 
 logger = logging.getLogger(__name__)
@@ -46,6 +45,8 @@ After analysis, respond with ONLY valid JSON (no markdown, no explanations):
 ALWAYS end with valid JSON output.
 """
 
+ANALYSIS_AGENT_MEMORY_PROMPT = ANALYSIS_AGENT_SYSTEM_PROMPT
+
 
 def create_analysis_agent(tools: list | None = None):
     """
@@ -60,88 +61,23 @@ def create_analysis_agent(tools: list | None = None):
     llm = get_llm(prompt_name="analysis")
     tools = tools_for_agent("analysis", tools)
     llm_with_tools = bind_agent_tools(llm, tools)
+    tool_names = [getattr(t, "name", str(t)) for t in tools]
 
-    tools_dict = {}
-    for tool in tools:
-        if isinstance(tool, BaseTool):
-            tools_dict[tool.name] = tool.func if hasattr(tool, "func") else tool
-        else:
-            tools_dict[resolve_tool_name(tool)] = tool
-
-    logger.info(f"Analysis agent tools: {list(tools_dict.keys())}")
-
-    def analysis_node(state):
-        """Analysis agent with tool execution loop."""
+    def analysis_node(state: dict[str, Any]) -> dict[str, Any]:
+        """Analysis agent node function."""
         try:
             messages = state.get("messages", [])
-
-            user_message = None
-            for m in messages:
-                if isinstance(m, HumanMessage):
-                    user_message = m
-                    break
-
-            if user_message is None:
-                user_message = HumanMessage(content="Analyze the biological data.")
-
-            raw_output, tool_calls_used, last_ai, exec_err = execute_agent_with_tools(
-                llm_with_tools=llm_with_tools,
-                system_prompt=ANALYSIS_AGENT_SYSTEM_PROMPT,
-                user_message=user_message,
-                tools_dict=tools_dict,
-                max_iterations=5,
-                full_message_history=messages,
+            system_prompt = inject_prompt_context(
+                ANALYSIS_AGENT_PROMPT, state=state, agent_name="analysis"
+            )
+            messages_to_send = prepare_messages_for_agent(
+                messages, agent_name="analysis", system_prompt=system_prompt
             )
 
-            default_json = {
-                "sequence_properties": {
-                    "length": 0,
-                    "molecular_weight": 0.0,
-                    "isoelectric_point": 0.0,
-                    "composition": {},
-                },
-                "key_findings": [],
-                "patterns_detected": [],
-                "quality_score": "medium",
-                "analysis_complete": False,
-                "status": "success" if raw_output else "error",
-                "error": None,
-            }
-
-            structured_data = safe_json_output(raw_output, default_json)
-
-            # Must always carry a message: a result on data/raw_output alone is not a
-            # state channel, so LangGraph drops it and the supervisor re-runs the task.
-            out: dict[str, Any] = {
-                "data": structured_data,
-                "raw_output": raw_output,
-                "tool_calls": tool_calls_used,
-                "error": exec_err,
-                "messages": [last_ai]
-                if last_ai is not None
-                else [AIMessage(content=raw_output or f"[AGENT_ERROR] {exec_err}")],
-            }
-            return out
-
+            return create_retry_response("Analysis", messages_to_send, tool_names, llm_with_tools)
         except Exception as e:
             logger.error(f"Analysis agent error: {e}", exc_info=True)
             return {
-                "data": {
-                    "sequence_properties": {
-                        "length": 0,
-                        "molecular_weight": 0.0,
-                        "isoelectric_point": 0.0,
-                        "composition": {},
-                    },
-                    "key_findings": [],
-                    "patterns_detected": [],
-                    "quality_score": "low",
-                    "analysis_complete": False,
-                    "status": "error",
-                    "error": str(e),
-                },
-                "raw_output": str(e),
-                "tool_calls": [],
                 "error": str(e),
                 "messages": [AIMessage(content=f"[AGENT_ERROR] Analysis failed: {e}")],
             }

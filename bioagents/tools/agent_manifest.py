@@ -212,21 +212,31 @@ def describe_agent_tools(max_tools_per_agent: int = 40) -> str:
     The supervisor must know which concrete tools each specialist holds; routing a task
     to an agent that cannot perform it is the failure this is meant to prevent.
     """
+    from bioagents.tools.tool_selection import get_selection
+
+    selection = get_selection()
+    fallback_instruction = (
+        "Route a task only to an agent whose tools can perform it. If no specialist agent has a "
+        "suitable bound tool, route to a sandbox code-writing agent (coder, ml, dl) — do NOT "
+        "route to agents marked with no bound tools."
+        if selection.mode == "selected"
+        else "Route a task only to an agent whose tools can perform it. If no agent has a "
+        "suitable tool, say so or route to tool_builder — do not delegate work that "
+        "cannot be done and then accept a narrative result."
+    )
     lines = [
         "[AGENT TOOL INVENTORY — which tools each agent actually has]",
-        "Route a task only to an agent whose tools can perform it. If no agent has a "
-        "suitable tool, say so or route to tool_builder — do not delegate work that "
-        "cannot be done and then accept a narrative result.",
+        fallback_instruction,
         "",
     ]
     for agent, names in sorted(agent_tool_names().items()):
+        if not names:
+            lines.append(f"- {agent}: (no bound tools in this session — do not route here)")
+            continue
         shown = names[:max_tools_per_agent]
         suffix = f" (+{len(names) - len(shown)} more)" if len(names) > len(shown) else ""
         lines.append(f"- {agent}: {', '.join(shown)}{suffix}")
 
-    from bioagents.tools.tool_selection import get_selection
-
-    selection = get_selection()
     lines.append("")
     if selection.mode == "selected":
         for role in ("coder", "ml", "dl"):

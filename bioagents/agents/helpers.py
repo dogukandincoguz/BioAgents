@@ -33,6 +33,7 @@ AGENT_CONDUCT_RULES = """[AGENT CONDUCT RULES — these override any conflicting
 1. EVIDENCE. Only report values that a tool actually returned in this conversation. If a
    number, sequence, structure, score or file does not appear in a tool result, it does
    not exist. Never estimate, approximate, or supply a "typical" value in its place.
+   Outputs, metrics, and files produced by sandbox code-execution agents (Coder, ML, DL — marked with [CODER_STATUS: completed] or listed in [WORKSPACE ARTIFACTS]) ARE verified tool/execution outputs. Never retract or dismiss results produced by Coder, ML, or DL agents simply because they ran in the Python sandbox rather than via a LangChain ToolMessage.
 
 2. TOOL ERRORS ARE NOT RESULTS. A tool result containing "status": "error",
    "capability_unavailable", "not_implemented", or "performed_any_computation": false
@@ -43,6 +44,7 @@ AGENT_CONDUCT_RULES = """[AGENT CONDUCT RULES — these override any conflicting
    cannot do work that requires tools you do not have. If the task needs a capability you
    lack, stop and report precisely what is missing and what you did accomplish — handing
    back is a successful outcome, not a failure.
+   Only call tools that are bound to your agent. Do NOT attempt tasks outside your specialist scope (e.g., Analysis must not attempt docking or database fetching; Literature must only search literature). When the next step requires another capability—such as molecular docking ('docking' agent), BLAST alignment ('genomics' agent), plotting ('visualization' agent), or custom Python/RDKit/pandas computation and file generation ('coder', 'ml', or 'dl' sandbox agents)—report your completed findings clearly and instruct the Supervisor which specialist or sandbox agent to call next.
 
 4. DO NOT SIMULATE. Never mock, stub, fake or hard-code a result to make a workflow
    appear to complete, and never substitute random values for a real computation.
@@ -72,8 +74,8 @@ def _conduct_message_content() -> str:
 
 MAX_RETRIES = 2
 
-MAX_TOOL_RESULT_LENGTH = 2000
-MAX_AI_CONTENT_LENGTH = 3000
+MAX_TOOL_RESULT_LENGTH = 12000
+MAX_AI_CONTENT_LENGTH = 8000
 MAX_CONTEXT_MESSAGES = 30
 
 
@@ -188,7 +190,7 @@ def create_retry_response(
     """
     from bioagents.prompts.tool_context import selected_system_messages
 
-    messages_with_system = selected_system_messages(messages_with_system)
+    messages_with_system = selected_system_messages(messages_with_system, agent_name=agent_name)
     for attempt in range(MAX_RETRIES + 1):
         logger.info(
             "Invoking LLM for %s (attempt %d/%d)",
@@ -291,11 +293,12 @@ def _truncate_content(content, max_length: int) -> str:
 
 def prepare_messages_for_agent(
     messages: list,
-    agent_name: str,  # noqa: ARG001
+    agent_name: str = "agent",  # noqa: ARG001
     max_messages: int = MAX_CONTEXT_MESSAGES,
     max_tool_result_len: int = MAX_TOOL_RESULT_LENGTH,
     max_ai_content_len: int = MAX_AI_CONTENT_LENGTH,
     summary_mode: bool = False,
+    system_prompt: str | None = None,
 ) -> list:
     """Prepare messages for an agent by windowing and truncating.
 
@@ -309,11 +312,15 @@ def prepare_messages_for_agent(
         max_tool_result_len: Max chars for tool result content
         max_ai_content_len: Max chars for AI message content
         summary_mode: If True, keep only final agent outputs (for report/summary)
+        system_prompt: Optional system prompt to prepend
 
     Returns:
         Windowed and truncated message list
     """
     if not messages:
+        if system_prompt is not None:
+            conduct = SystemMessage(content=_conduct_message_content())
+            return [SystemMessage(content=system_prompt), conduct]
         return messages
 
     conduct = SystemMessage(content=_conduct_message_content())
@@ -341,6 +348,8 @@ def prepare_messages_for_agent(
                     if not has_tool_calls and name not in ("Supervisor",):
                         cleaned_content = _strip_signature_blobs(content)
                         truncated = _truncate_content(cleaned_content, max_ai_content_len)
+                        if name and not truncated.startswith(f"[{name}"):
+                            truncated = f"[{name} Agent]:\n{truncated}"
                         kept.append(AIMessage(content=truncated, name=name))
             elif isinstance(msg, SystemMessage):
                 content = get_message_content(msg)
@@ -349,7 +358,10 @@ def prepare_messages_for_agent(
         for task_msg in supervisor_tasks:
             if task_msg not in kept:
                 kept.append(task_msg)
-        return [conduct, *kept[-max_messages:]]
+        out = [conduct, *kept[-max_messages:]]
+        if system_prompt is not None:
+            out.insert(0, SystemMessage(content=system_prompt))
+        return out
 
     window_start = max(0, len(messages) - max_messages)
     windowed = messages[window_start:]
@@ -392,27 +404,35 @@ def prepare_messages_for_agent(
             cleaned = _strip_signature_blobs(ai_content)
             text = get_content_text(cleaned)
             has_tool_calls = hasattr(msg, "tool_calls") and msg.tool_calls
+            msg_name = getattr(msg, "name", None)
+
             if len(text) > max_ai_content_len and not has_tool_calls:
-                truncated = text[:max_ai_content_len] + "\n... [truncated]"
-                new_msg = AIMessage(content=truncated, name=getattr(msg, "name", ""))
-                if has_tool_calls:
-                    new_msg.tool_calls = msg.tool_calls
-                result.append(new_msg)
-            elif cleaned != ai_content:
-                new_msg = AIMessage(
-                    content=cleaned if isinstance(cleaned, str) else text,
-                    name=getattr(msg, "name", ""),
-                )
-                if has_tool_calls:
-                    new_msg.tool_calls = msg.tool_calls
-                result.append(new_msg)
+                final_content = text[:max_ai_content_len] + "\n... [truncated]"
+            elif isinstance(cleaned, str):
+                final_content = cleaned
             else:
-                result.append(msg)
+                final_content = text
+
+            if (
+                msg_name
+                and isinstance(final_content, str)
+                and final_content.strip()
+                and not final_content.startswith(f"[{msg_name}")
+            ):
+                final_content = f"[{msg_name} Agent]:\n{final_content}"
+
+            new_msg = AIMessage(content=final_content, name=msg_name or "")
+            if has_tool_calls:
+                new_msg.tool_calls = msg.tool_calls
+            result.append(new_msg)
         else:
             result.append(msg)
 
     # Conduct rules go last: the most recent instruction is the most reliably followed.
     result.append(conduct)
+
+    if system_prompt is not None:
+        result.insert(0, SystemMessage(content=system_prompt))
 
     return result
 
@@ -437,6 +457,8 @@ def invoke_with_retry(
         Dict with 'messages' key containing the response
     """
     from bioagents.prompts.tool_context import selected_system_messages
+
+    messages_with_system = selected_system_messages(messages_with_system, agent_name=agent_name)
 
     messages_with_system = selected_system_messages(messages_with_system)
     for attempt in range(max_retries + 1):
