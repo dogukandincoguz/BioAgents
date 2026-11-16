@@ -1,5 +1,6 @@
 """Supervisor Agent for routing tasks to specialized agents."""
 
+import contextvars
 import json
 import logging
 import uuid
@@ -10,17 +11,18 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, Field
 
-from bioagents.agents.helpers import extract_best_content
+from bioagents.agents.helpers import extract_best_content, get_message_content
 from bioagents.agents.supervisor_completion import check_completed_work_guard
 from bioagents.agents.supervisor_helpers import (
     CODE_AGENTS,
+    apply_post_llm_routing_overrides,
     check_code_agent_task_completed,
     check_coder_routing_guard,
     check_coder_should_force_finish,
+    check_engagement_shortcircuit,
     check_finish_if_code_agent_substantive_repeat,
     check_for_empty_response_loop,
     check_for_engagement_request,
-    check_for_missing_tool,
     check_for_repeated_routing,
     check_for_research_failure,
     check_query_ambiguity,
@@ -30,13 +32,70 @@ from bioagents.agents.supervisor_helpers import (
     extract_original_query,
     extract_steering_messages,
     get_all_created_tools,
+    has_completed_work_evidence,
 )
 from bioagents.llms.llm_provider import get_llm, get_structured_output_kwargs_for_routing
 from bioagents.prompts.prompt_loader import load_prompt
 from bioagents.prompts.tool_context import selected_system_messages
-from bioagents.tools.selected_runtime import bind_agent_node
+from bioagents.tools.selected_runtime import bind_agent_node, tools_for_agent
+from bioagents.tools.tool_selection import get_selection
+
+
+def get_tool_mode() -> str:
+    return get_selection().mode
+
 
 logger = logging.getLogger(__name__)
+
+_TOOL_DEPENDENT_AGENTS = {
+    "tool_builder",
+    "web_browser",
+    "paper_replication",
+    "tool_discovery",
+    "shell",
+    "git",
+    "environment",
+    "transcriptomics",
+}
+
+_active_options_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_active_options_var", default=None
+)
+
+
+def _is_autonomous_mode(messages: list) -> bool:
+    """Check if the conversation is running in autonomous mode (no user interaction)."""
+    autonomous_phrases = (
+        "do not ask for user input",
+        "run autonomously",
+        "without user input",
+        "autonomous mode",
+    )
+    for msg in messages:
+        if isinstance(msg, HumanMessage) or (
+            hasattr(msg, "__class__") and msg.__class__.__name__ == "HumanMessage"
+        ):
+            content = get_message_content(msg).lower()
+            if any(phrase in content for phrase in autonomous_phrases):
+                return True
+    return False
+
+
+def _build_autonomous_directive() -> HumanMessage:
+    """Create the directive instructing agents to proceed without asking the user."""
+    return HumanMessage(
+        content="[AUTONOMOUS MODE DIRECTIVE] User input is unavailable in autonomous execution. "
+        "Do NOT wait for user clarification. Make the most reasonable scientific decision using "
+        "the available tools, workspace artifacts, and context, and route to the appropriate "
+        "specialist or sandbox agent (e.g., coder, ml, dl, research, analysis, docking, genomics) "
+        "to continue executing the workflow.",
+        name="System",
+    )
+
+
+def _has_recent_autonomous_directive(messages: list) -> bool:
+    """Return True if a recent message already carries the autonomous directive."""
+    return any("[AUTONOMOUS MODE DIRECTIVE]" in get_message_content(msg) for msg in messages[-3:])
 
 
 class RouteResponse(BaseModel):
@@ -130,9 +189,20 @@ def create_supervisor_agent(members: list[str]):
         RouteResponse,
         **get_structured_output_kwargs_for_routing(),
     )
-    supervisor_chain = prompt | RunnableLambda(
-        lambda value: routing_llm.invoke(selected_system_messages(value.to_messages()))
-    )
+
+    def _invoke_routing(value):
+        msgs = list(value.to_messages())
+        curr_options = _active_options_var.get()
+        if curr_options:
+            for i in range(len(msgs) - 1, -1, -1):
+                if isinstance(msgs[i], SystemMessage) and "Choose from:" in str(msgs[i].content):
+                    msgs[i] = SystemMessage(
+                        content=f"Given the conversation above, who should act next? Choose from: {', '.join(curr_options)}"
+                    )
+                    break
+        return routing_llm.invoke(selected_system_messages(msgs))
+
+    supervisor_chain = prompt | RunnableLambda(_invoke_routing)
 
     def supervisor_node(state):
         """
@@ -145,46 +215,73 @@ def create_supervisor_agent(members: list[str]):
             A dict with next_agent and reasoning for routing
         """
         messages = state["messages"]
+        autonomous = _is_autonomous_mode(messages)
 
-        has_engagement, engagement_data = check_for_engagement_request(messages)
-        if has_engagement and engagement_data is not None:
-            engagement_id = str(uuid.uuid4())[:8]
-            engagement_data["id"] = engagement_id
-            logger.info(
-                f"Agent requested user engagement: type={engagement_data.get('type')}, "
-                f"question={engagement_data.get('question', '')[:80]}"
-            )
-            # Store engagement data in a system message so the server can extract it
-            engagement_marker = SystemMessage(
-                content=f"[ENGAGEMENT_PENDING] {json.dumps(engagement_data)}"
-            )
-            return {
-                "next": "user_input",
-                "reasoning": f"Agent requested user input ({engagement_data.get('type')}): "
-                f"{engagement_data.get('question', '')[:100]}",
-                "messages": [engagement_marker],
-            }
+        active_members = list(members)
+        if get_tool_mode() == "selected":
+            active_members = [
+                m
+                for m in active_members
+                if m not in _TOOL_DEPENDENT_AGENTS or len(tools_for_agent(m)) > 0
+            ]
+        if autonomous:
+            active_members = [m for m in active_members if m != "user_input"]
 
-        ambiguity = check_query_ambiguity(messages)
-        if ambiguity:
-            engagement_id = str(uuid.uuid4())[:8]
-            clarification = {
-                "id": engagement_id,
-                "type": "clarification",
-                "question": ambiguity,
-                "options": [],
-                "context": "The original query lacks sufficient detail to route to the right agent.",
-                "agent": "Supervisor",
-            }
-            clarification_marker = SystemMessage(
-                content=f"[ENGAGEMENT_PENDING] {json.dumps(clarification)}"
-            )
-            logger.info(f"Query ambiguous, asking clarification: {ambiguity[:80]}")
-            return {
-                "next": "user_input",
-                "reasoning": f"Query needs clarification: {ambiguity}",
-                "messages": [clarification_marker],
-            }
+        active_options = [*active_members, "FINISH"]
+
+        injected_autonomous_directive = None
+        if check_engagement_shortcircuit(messages):
+            if autonomous:
+                task_done, done_reason = check_code_agent_task_completed(messages)
+                if task_done or has_completed_work_evidence(messages):
+                    return {
+                        "next": "FINISH",
+                        "reasoning": done_reason
+                        or "Completed work evidence found in autonomous mode.",
+                        "messages": [],
+                    }
+                if not _has_recent_autonomous_directive(messages):
+                    injected_autonomous_directive = _build_autonomous_directive()
+            else:
+                has_engagement, engagement_data = check_for_engagement_request(messages)
+                if has_engagement and engagement_data is not None:
+                    engagement_id = str(uuid.uuid4())[:8]
+                    engagement_data["id"] = engagement_id
+                    logger.info(
+                        f"Agent requested user engagement: type={engagement_data.get('type')}, "
+                        f"question={engagement_data.get('question', '')[:80]}"
+                    )
+                    # Store engagement data in a system message so the server can extract it
+                    engagement_marker = SystemMessage(
+                        content=f"[ENGAGEMENT_PENDING] {json.dumps(engagement_data)}"
+                    )
+                    return {
+                        "next": "user_input",
+                        "reasoning": f"Agent requested user input ({engagement_data.get('type')}): "
+                        f"{engagement_data.get('question', '')[:100]}",
+                        "messages": [engagement_marker],
+                    }
+
+                ambiguity = check_query_ambiguity(messages)
+                if ambiguity:
+                    engagement_id = str(uuid.uuid4())[:8]
+                    clarification = {
+                        "id": engagement_id,
+                        "type": "clarification",
+                        "question": ambiguity,
+                        "options": [],
+                        "context": "The original query lacks sufficient detail to route to the right agent.",
+                        "agent": "Supervisor",
+                    }
+                    clarification_marker = SystemMessage(
+                        content=f"[ENGAGEMENT_PENDING] {json.dumps(clarification)}"
+                    )
+                    logger.info(f"Query ambiguous, asking clarification: {ambiguity[:80]}")
+                    return {
+                        "next": "user_input",
+                        "reasoning": f"Query needs clarification: {ambiguity}",
+                        "messages": [clarification_marker],
+                    }
 
         failed_agents: set = state.get("failed_agents") or set()
 
@@ -327,7 +424,7 @@ def create_supervisor_agent(members: list[str]):
                         if original_query:
                             task_instruction = f"{task_instruction} Original task: {original_query}"
 
-                    target_agent = "research" if "research" in members else "analysis"
+                    target_agent = "research" if "research" in active_members else "analysis"
                     handoff_msg = HumanMessage(
                         content=f"[SUPERVISOR TASK] {task_instruction}", name="Supervisor"
                     )
@@ -361,7 +458,7 @@ def create_supervisor_agent(members: list[str]):
                 for m in escape_order
                 if m != looping_lower
                 and m not in failed_agents
-                and m in members
+                and m in active_members
                 and m not in tried_for_agent
             ]
             if alternatives:
@@ -407,13 +504,15 @@ def create_supervisor_agent(members: list[str]):
                     "loop_escape_tried": loop_escape_tried,
                 }
 
-        if "tool_builder" in members:
-            should_route_to_builder, reason = check_for_missing_tool(messages)
-            if should_route_to_builder:
-                logger.info(f"Supervisor: Overriding to route to tool_builder - {reason}")
+        if "tool_builder" in active_members:
+            override_agent, override_reason = apply_post_llm_routing_overrides(
+                "", messages, active_members
+            )
+            if override_agent == "tool_builder":
+                logger.info(f"Supervisor: Overriding to route to tool_builder - {override_reason}")
                 return {
                     "next": "tool_builder",
-                    "reasoning": f"Programmatic detection: {reason}. Routing to tool_builder to create the missing tool.",
+                    "reasoning": f"{override_reason}. Routing to tool_builder to create the missing tool.",
                     "messages": [],
                 }
 
@@ -431,6 +530,9 @@ def create_supervisor_agent(members: list[str]):
 
         # Window history for the routing LLM: the user query plus the last 12 messages.
         routing_messages = messages[:1] + messages[-12:] if len(messages) > 14 else messages
+
+        if injected_autonomous_directive:
+            routing_messages = [*list(routing_messages), injected_autonomous_directive]
 
         execution_success, exec_tool_name = check_tool_builder_execution_success(messages)
         if execution_success:
@@ -466,12 +568,16 @@ def create_supervisor_agent(members: list[str]):
             )
             routing_messages = [steering_context, *list(routing_messages)]
 
-        result = supervisor_chain.invoke({"messages": routing_messages})
-        if result is None:
-            logger.warning(
-                "Supervisor: structured routing returned None (likely parse failure); retrying once."
-            )
-            result = supervisor_chain.invoke({"messages": messages})
+        token = _active_options_var.set(active_options)
+        try:
+            result = supervisor_chain.invoke({"messages": routing_messages})
+            if result is None:
+                logger.warning(
+                    "Supervisor: structured routing returned None (likely parse failure); retrying once."
+                )
+                result = supervisor_chain.invoke({"messages": messages})
+        finally:
+            _active_options_var.reset(token)
 
         if result is None:
             logger.error(
@@ -492,7 +598,11 @@ def create_supervisor_agent(members: list[str]):
         if research_failed and result.next_agent == "research":
             # Research failing means the data was not fetched, not that code is needed.
             alt = next(
-                (m for m in ("data_acquisition", "literature", "web_browser") if m in members),
+                (
+                    m
+                    for m in ("data_acquisition", "literature", "web_browser")
+                    if m in active_members
+                ),
                 "report",
             )
             logger.warning(
@@ -505,7 +615,7 @@ def create_supervisor_agent(members: list[str]):
 
         if planner_just_responded and result.next_agent == "planner":
             for candidate in ("research", "data_acquisition", "report"):
-                if candidate in members:
+                if candidate in active_members:
                     result.next_agent = candidate
                     break
             original_query = ""
@@ -524,12 +634,57 @@ def create_supervisor_agent(members: list[str]):
                 result.next_agent,
             )
 
+        # Check tool_builder availability if routed to tool_builder before code/completion guards
+        if result.next_agent == "tool_builder":
+            tb_tools = tools_for_agent("tool_builder")
+            if not tb_tools:
+                logger.debug(
+                    "Supervisor: tool_builder override skipped because tool_builder has no bound tools."
+                )
+                alt = next(
+                    (m for m in ("coder", "research", "analysis") if m in active_members),
+                    "FINISH",
+                )
+                result.next_agent = alt
+
+        # Autonomous mode handling if next_agent is user_input before code/completion guards
+        if autonomous and result.next_agent == "user_input":
+            task_done, done_reason = check_code_agent_task_completed(messages)
+            if task_done or has_completed_work_evidence(messages):
+                result.next_agent = "FINISH"
+                result.reasoning = (
+                    done_reason or "Completed work evidence found in autonomous mode."
+                )
+            else:
+                fallback_agent = (
+                    "coder"
+                    if "coder" in active_members
+                    else (
+                        "research"
+                        if "research" in active_members
+                        else (active_members[0] if active_members else "FINISH")
+                    )
+                )
+                logger.info(
+                    "Supervisor: Autonomous mode overrides 'user_input' to fallback agent '%s'.",
+                    fallback_agent,
+                )
+                result.next_agent = fallback_agent
+                result.reasoning = (
+                    f"User input requested in autonomous mode; falling back to '{fallback_agent}' "
+                    "with autonomous directive."
+                )
+                if not injected_autonomous_directive and not _has_recent_autonomous_directive(
+                    messages
+                ):
+                    injected_autonomous_directive = _build_autonomous_directive()
+
         # The model over-routes to the code agents; redirect when a specialist has matching tools.
         if result.next_agent in CODE_AGENTS:
             replacement, guard_reason = check_coder_routing_guard(
-                messages, members, result.task_for_agent or result.reasoning
+                messages, active_members, result.task_for_agent or result.reasoning
             )
-            if replacement and replacement in members:
+            if replacement and replacement in active_members:
                 logger.info(
                     "Supervisor: redirecting '%s' -> '%s'. %s",
                     result.next_agent,
@@ -541,7 +696,7 @@ def create_supervisor_agent(members: list[str]):
 
         # Finished work must not be commissioned again under a new agent's name.
         done_route, done_reason, done_task = check_completed_work_guard(
-            messages, result.next_agent, result.task_for_agent or "", members
+            messages, result.next_agent, result.task_for_agent or "", active_members
         )
         if done_route:
             logger.info(
@@ -581,6 +736,13 @@ def create_supervisor_agent(members: list[str]):
                 )
                 handoff_messages.append(handoff_msg)
                 logger.info(f"Supervisor handoff to {result.next_agent}: {result.task_for_agent}")
+
+        if (
+            result.next_agent != "FINISH"
+            and injected_autonomous_directive
+            and injected_autonomous_directive not in handoff_messages
+        ):
+            handoff_messages.append(injected_autonomous_directive)
 
         return {
             "next": result.next_agent,

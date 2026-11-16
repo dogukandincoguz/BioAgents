@@ -40,9 +40,18 @@ TOOL_MISSING_PATTERNS = [
     r"no suitable.*found",
     r"cannot.*search.*by gene name",
     r"missing required parameters",
-    r"tool.*not.*exist",
-    r"no.*capability",
+    r"missing.*tool",
+    r"need.*custom.*tool",
+    r"tool.*unavailable",
+    r"cannot.*find.*tool",
+    r"create.*new.*tool",
+    r"build.*tool",
+    r"implement.*tool",
+    r"tool_not_available",
     r"lacks.*capability",
+    r"\bno\s+(?:registered\s+|bound\s+)?tool\s+capability\b",
+    r"\btool\s+does\s+not\s+exist\b",
+    r"\bno\s+tool\s+exists\b",
 ]
 
 
@@ -56,7 +65,9 @@ _TASK_COMPLETION_MARKERS = re.compile(
     r"|PIPELINE\s+COMPLETE\b|ALL\s+STEPS\s+COMPLETED?\b"
     r"|METRIC:|Accuracy[:\s]+\d|Loss[:\s]+\d|Epoch\s+\d+/\d+"
     r"|training complete|evaluation accuracy|successfully trained"
-    r"|model trained|F1[:\s]+\d|AUC[:\s]+\d|precision[:\s]+\d|recall[:\s]+\d)",
+    r"|model trained|F1[:\s]+\d|AUC[:\s]+\d|AUROC[:\s]+\d|ROC-AUC[:\s]+\d"
+    r"|precision[:\s]+\d|recall[:\s]+\d"
+    r"|experiment\s+completed|deliverables\s+produced)",
     re.IGNORECASE,
 )
 
@@ -396,9 +407,31 @@ def check_for_missing_tool(messages) -> tuple[bool, str]:
     Returns:
         Tuple of (should_route_to_tool_builder, reason)
     """
+    if not messages:
+        return False, ""
+
+    last_message = messages[-1]
+    if isinstance(last_message, HumanMessage) or (
+        hasattr(last_message, "__class__") and last_message.__class__.__name__ == "HumanMessage"
+    ):
+        return False, ""
+    if getattr(last_message, "name", None) in ("ToolBuilder", "tool_builder", "System"):
+        return False, ""
+    if "[AUTONOMOUS MODE DIRECTIVE]" in str(getattr(last_message, "content", "")):
+        return False, ""
+
     recent_messages = messages[-3:] if len(messages) >= 3 else messages
 
     for msg in recent_messages:
+        if isinstance(msg, HumanMessage) or (
+            hasattr(msg, "__class__") and msg.__class__.__name__ == "HumanMessage"
+        ):
+            continue
+        if getattr(msg, "name", None) in ("ToolBuilder", "tool_builder", "System"):
+            continue
+        if "[AUTONOMOUS MODE DIRECTIVE]" in str(getattr(msg, "content", "")):
+            continue
+
         content = ""
         if hasattr(msg, "content"):
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -413,6 +446,76 @@ def check_for_missing_tool(messages) -> tuple[bool, str]:
                 return True, f"Detected missing tool: pattern '{pattern}' matched"
 
     return False, ""
+
+
+def apply_post_llm_routing_overrides(
+    next_agent: str,
+    messages: list,
+    members: list[str] | set[str] | None = None,
+) -> tuple[str, str]:
+    """
+    Check routing overrides for tool_builder availability.
+
+    Before overriding next_agent to tool_builder when check_for_missing_tool is True,
+    verifies whether tool_builder actually has any bound tools in the active runtime.
+    """
+    if members is not None and "tool_builder" not in members:
+        return next_agent, ""
+
+    should_route_to_builder, reason = check_for_missing_tool(messages)
+    if should_route_to_builder:
+        try:
+            from bioagents.tools.selected_runtime import tools_for_agent
+
+            tb_tools = tools_for_agent("tool_builder")
+        except Exception:
+            tb_tools = []
+
+        if not tb_tools:
+            logger.debug(
+                "Supervisor: tool_builder override skipped because tool_builder has no bound tools."
+            )
+            return next_agent, ""
+        return "tool_builder", f"Programmatic detection: {reason}"
+
+    return next_agent, ""
+
+
+def has_completed_work_evidence(messages) -> bool:
+    """
+    Check if there is evidence of completed work in the message history.
+
+    Recognizes ML/DL completion markers, training summaries, and evaluation metrics.
+    """
+    if not messages:
+        return False
+    from bioagents.agents.supervisor_completion import current_turn_start
+
+    start = current_turn_start(messages)
+    for msg in reversed(messages[start:]):
+        if not (
+            isinstance(msg, AIMessage)
+            or (hasattr(msg, "__class__") and msg.__class__.__name__ == "AIMessage")
+        ):
+            continue
+        content = get_message_content(msg)
+        if not content:
+            continue
+        if COMPLETION_MARKER in content:
+            return True
+        if _NOT_COMPLETE.search(content):
+            continue
+        if _TASK_COMPLETION_MARKERS.search(content):
+            return True
+    return False
+
+
+def check_engagement_shortcircuit(messages) -> bool:
+    """Check if messages trigger an engagement request or query ambiguity shortcircuit."""
+    has_eng, eng_data = check_for_engagement_request(messages)
+    if has_eng and eng_data is not None:
+        return True
+    return bool(check_query_ambiguity(messages))
 
 
 def check_tool_builder_execution_success(messages) -> tuple[bool, str]:
