@@ -35,3 +35,4 @@ joblib==1.6.0
 tqdm==4.70.1
 openpyxl==3.1.5
 chembl-webresource-client==0.10.9
+tabulate==0.10.0

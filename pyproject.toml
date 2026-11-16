@@ -55,6 +55,7 @@ dependencies = [
     # an ImportError traceback instead of a result.
     "seaborn>=0.13.2",
     "statsmodels>=0.14.2",
+    "tabulate>=0.10.0",
     # Required by the real ESM tools (bioagents/tools/esm_tools.py) and by the local
     # ProteinMPNN runner. These were previously only in the optional "esm" extra, so a
     # plain `uv sync` removed them and those tools failed at import.

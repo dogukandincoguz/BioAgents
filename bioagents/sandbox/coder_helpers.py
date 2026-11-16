@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 DEFAULT_CODER_IMPORTS = [
     "pandas",
+    "tabulate",
     "numpy.*",
     "matplotlib.*",
     "scipy.*",
