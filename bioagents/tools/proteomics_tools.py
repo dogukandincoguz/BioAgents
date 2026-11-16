@@ -1,10 +1,52 @@
 """Proteomics tools for fetching protein data from UniProt."""
 
 import json
+import logging
+import re
 from typing import Literal
 
 import requests
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
+
+
+def _search_uniprot_fasta_fallback(query_id: str) -> str | None:
+    """Fallback search when direct UniProtKB accession fetch fails."""
+    query = re.sub(r"[_]+", " ", query_id).strip()
+    if not query:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://rest.uniprot.org/uniprotkb/search",
+            params={"query": query, "format": "fasta", "size": "1"},
+            timeout=15,
+        )
+        status = getattr(resp, "status_code", None)
+        text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+        if status == 200 and text.strip().startswith(">"):
+            return text.strip()
+    except requests.RequestException as exc:
+        logger.debug("UniProt text fallback search failed for %s: %s", query_id, exc)
+
+    tokens = query.split()
+    if len(tokens) >= 2:
+        try:
+            gene_query = f"gene:{tokens[0]} AND {' '.join(tokens[1:])}"
+            resp = requests.get(
+                "https://rest.uniprot.org/uniprotkb/search",
+                params={"query": gene_query, "format": "fasta", "size": "1"},
+                timeout=15,
+            )
+            status = getattr(resp, "status_code", None)
+            text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+            if status == 200 and text.strip().startswith(">"):
+                return text.strip()
+        except requests.RequestException as exc:
+            logger.debug("UniProt gene fallback search failed for %s: %s", query_id, exc)
+
+    return None
 
 
 def fetch_uniprot_fasta_impl(protein_id: str, timeout: int = 10) -> str:
@@ -18,17 +60,34 @@ def fetch_uniprot_fasta_impl(protein_id: str, timeout: int = 10) -> str:
     Returns:
         The FASTA sequence as a string, or an error message if the fetch fails.
     """
+    clean_id = protein_id.strip()
+    if not clean_id:
+        return "Error: Protein ID cannot be empty."
+
     try:
-        url = f"https://rest.uniprot.org/uniprotkb/{protein_id}.fasta"
+        url = f"https://rest.uniprot.org/uniprotkb/{clean_id}.fasta"
 
         response = requests.get(url, timeout=timeout)
+        status = getattr(response, "status_code", None)
+        if status in (400, 404):
+            fallback_seq = _search_uniprot_fasta_fallback(clean_id)
+            if fallback_seq:
+                return fallback_seq
+            return f"Error: Protein ID '{clean_id}' not found in UniProt."
+
         response.raise_for_status()
 
-        return str(response.text.strip())
+        text = response.text if isinstance(getattr(response, "text", None), str) else ""
+        return str(text.strip())
 
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            return f"Error: Protein '{protein_id}' not found in UniProt."
+        resp = getattr(e, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        if status in (400, 404):
+            fallback_seq = _search_uniprot_fasta_fallback(clean_id)
+            if fallback_seq:
+                return fallback_seq
+            return f"Error: Protein ID '{clean_id}' not found in UniProt."
         return f"Error fetching protein data: {e!s}"
 
     except Exception as e:

@@ -106,7 +106,7 @@ class AgentState(dict):
     tool_usage_log: list[dict] | None = None
 
 
-def _detect_consecutive_duplicate_calls(messages: list, agent_name: str) -> tuple[bool, str]:
+def _detect_consecutive_duplicate_calls(messages: list, agent_name: str = "") -> tuple[bool, str]:
     """Detect consecutive identical tool calls (same name + same args) by the same agent.
 
     Read-only discovery tools (``DISCOVERY_TOOL_NAMES``) get the higher
@@ -117,8 +117,9 @@ def _detect_consecutive_duplicate_calls(messages: list, agent_name: str) -> tupl
     """
     import hashlib
     import json
+    import re
 
-    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
     from bioagents.limits import (
         DISCOVERY_TOOL_NAMES,
@@ -126,33 +127,81 @@ def _detect_consecutive_duplicate_calls(messages: list, agent_name: str) -> tupl
         MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS,
     )
 
-    calls: list[tuple[str, str]] = []
+    _TRANSIENT_PHRASES = (
+        "too many requests",
+        "rate limit",
+        "rate-limit",
+        "rate limited",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "timed out",
+    )
+    _TRANSIENT_HTTP_RE = re.compile(
+        r"\b(?:http(?:\s+status)?|status(?:\s+code)?|error(?:\s+code)?)\s*:?\s*(?:429|502|503|504)\b"
+    )
+    _TRANSIENT_CODE_WORD_RE = re.compile(r"\b(?:429|502|503|504)\b")
+
+    # Build mapping of tool_call_id -> (ToolMessage.content, status) since last HumanMessage
+    tool_results: dict[str, tuple[str, str]] = {}
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        if isinstance(msg, ToolMessage) or (
+            hasattr(msg, "__class__") and msg.__class__.__name__ == "ToolMessage"
+        ):
+            tc_id = getattr(msg, "tool_call_id", None)
+            if tc_id is None and isinstance(msg, dict):
+                tc_id = msg.get("tool_call_id")
+            if tc_id:
+                content = getattr(msg, "content", "")
+                msg_status = getattr(msg, "status", "") or ""
+                if not msg_status and isinstance(msg, dict):
+                    msg_status = str(msg.get("status") or "")
+                tool_results[str(tc_id)] = (
+                    content if isinstance(content, str) else str(content),
+                    str(msg_status).lower(),
+                )
+
+    calls: list[tuple[str, str, bool]] = []
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             break
         if (
             isinstance(msg, AIMessage)
-            and getattr(msg, "name", "") == agent_name
+            and (not agent_name or getattr(msg, "name", "") == agent_name)
             and hasattr(msg, "tool_calls")
             and msg.tool_calls
         ):
             for tc in msg.tool_calls:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("args", {})
+                tool_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                tool_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
                 args_str = json.dumps(tool_args, sort_keys=True, default=str)
                 call_hash = hashlib.md5(
                     f"{tool_name}:{args_str}".encode(), usedforsecurity=False
                 ).hexdigest()
-                calls.append((call_hash, tool_name))
+                tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+                raw_content, msg_status = tool_results.get(str(tc_id), ("", ""))
+                content_lower = raw_content.lower()
+                is_transient = (
+                    any(phrase in content_lower for phrase in _TRANSIENT_PHRASES)
+                    or bool(_TRANSIENT_HTTP_RE.search(content_lower))
+                    or (
+                        msg_status == "error"
+                        and bool(_TRANSIENT_CODE_WORD_RE.search(content_lower))
+                    )
+                )
+                calls.append((call_hash, tool_name, is_transient))
 
     if not calls:
         return False, ""
 
-    first_hash, first_tool = calls[0]
-    consecutive = 1
-    for call_hash, _ in calls[1:]:
+    first_hash, first_tool, first_transient = calls[0]
+    consecutive = 0 if first_transient else 1
+    for call_hash, _, is_transient in calls[1:]:
         if call_hash == first_hash:
-            consecutive += 1
+            if not is_transient:
+                consecutive += 1
         else:
             break
 
@@ -162,8 +211,9 @@ def _detect_consecutive_duplicate_calls(messages: list, agent_name: str) -> tupl
         else MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
     )
     if consecutive >= limit:
+        agent_str = f"Agent '{agent_name}'" if agent_name else "Agent"
         return True, (
-            f"Agent '{agent_name}' made {consecutive} consecutive identical tool calls "
+            f"{agent_str} made {consecutive} consecutive identical tool calls "
             f"('{first_tool}'). Breaking loop (limit: {limit})."
         )
 

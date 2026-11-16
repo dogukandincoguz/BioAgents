@@ -100,6 +100,8 @@ DISCOVERY_TOOL_NAMES: frozenset[str] = frozenset(
         "search_custom_tools",
         "list_custom_tools",
         "get_tool_code",
+        "search_pubmed",
+        "ClinVar_search_variants",
     }
     | {
         name.strip()

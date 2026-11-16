@@ -1,6 +1,9 @@
 """Literature search tools for PubMed, arXiv, and bioRxiv."""
 
 import json
+import os
+import threading
+import time
 import xml.etree.ElementTree as ET  # nosec B405
 
 import requests
@@ -8,6 +11,51 @@ from langchain_core.tools import tool
 
 HTTP_TIMEOUT = 30
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+_PUBMED_LOCK = threading.Lock()
+_LAST_PUBMED_REQUEST_TS = 0.0
+
+
+def _throttled_ncbi_get(url: str, params: dict, timeout: int = 15) -> requests.Response:
+    """Make a throttled and retry-enabled GET request to NCBI E-utilities."""
+    global _LAST_PUBMED_REQUEST_TS
+
+    ncbi_api_key = os.environ.get("NCBI_API_KEY")
+    req_params = (
+        {**params, "api_key": ncbi_api_key}
+        if (ncbi_api_key and "api_key" not in params)
+        else params
+    )
+    min_interval = 0.12 if ("api_key" in req_params) else 0.38
+    backoff_delays = [1.0, 2.0, 4.0]
+    max_retries = 3
+
+    for attempt in range(max_retries + 1):
+        with _PUBMED_LOCK:
+            now = time.time()
+            elapsed = now - _LAST_PUBMED_REQUEST_TS
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            _LAST_PUBMED_REQUEST_TS = time.time()
+
+        try:
+            response = requests.get(url, params=req_params, timeout=timeout)
+            status = getattr(response, "status_code", 200)
+            if (
+                isinstance(status, int)
+                and status in (429, 500, 502, 503, 504)
+                and attempt < max_retries
+            ):
+                time.sleep(backoff_delays[attempt])
+                continue
+            return response
+        except requests.exceptions.RequestException:
+            if attempt < max_retries:
+                time.sleep(backoff_delays[attempt])
+                continue
+            raise
+
+    raise RuntimeError("Exhausted NCBI GET retry loop without response")
 
 
 @tool
@@ -32,7 +80,7 @@ def search_pubmed(query: str, max_results: int = 10) -> str:
             "retmode": "json",
             "sort": "relevance",
         }
-        search_resp = requests.get(search_url, params=search_params, timeout=HTTP_TIMEOUT)
+        search_resp = _throttled_ncbi_get(search_url, params=search_params, timeout=HTTP_TIMEOUT)
         search_resp.raise_for_status()
         search_data = search_resp.json()
 
@@ -46,7 +94,7 @@ def search_pubmed(query: str, max_results: int = 10) -> str:
             "id": ",".join(id_list),
             "retmode": "xml",
         }
-        fetch_resp = requests.get(fetch_url, params=fetch_params, timeout=HTTP_TIMEOUT)
+        fetch_resp = _throttled_ncbi_get(fetch_url, params=fetch_params, timeout=HTTP_TIMEOUT)
         fetch_resp.raise_for_status()
 
         root = ET.fromstring(fetch_resp.text)  # nosec B314
